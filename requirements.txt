@@ -1,0 +1,48 @@
+# Runtime dependencies for agtracks.
+#
+#   pip install -r requirements.txt
+#
+# Two things are NOT in here and must be handled separately -- see the notes at the bottom:
+#   1. alphagenome-pytorch  (not on PyPI; install from git)
+#   2. the AlphaGenome weights themselves (not redistributable here)
+
+# --- core ---
+torch>=2.2                # any recent 2.x; see the CUDA note below
+numpy>=1.26
+safetensors>=0.4          # reads the AlphaGenome checkpoint
+
+# --- genomic file access ---
+pyfaidx>=0.8              # indexed FASTA random access
+pyBigWig>=0.3.22          # bigWig target reads
+
+# --- pulled in by alphagenome-pytorch, listed so a failure is legible ---
+einops>=0.8
+
+# ---------------------------------------------------------------------------
+# 1. THE TRUNK. Not on PyPI, so pip cannot resolve it from this file:
+#
+#      pip install "alphagenome-pytorch @ git+https://github.com/genomicsxai/alphagenome-pytorch"
+#
+#    `agtracks.train_seqpar` additionally needs
+#    `alphagenome_pytorch.sequence_parallel.create_sequence_parallel_strategy`, so if that import
+#    fails your version predates sequence-parallel support -- update before using that path. The
+#    single-GPU and DDP paths do not need it.
+#
+# 2. THE WEIGHTS. Supply your own AlphaGenome checkpoint and pass it with `--checkpoint`. Nothing
+#    is shipped here, and the trainer refuses to start from random init on purpose: RMSBatchNorm
+#    never updates `running_var`, so an uninitialised model trains with no normalisation and
+#    reports no error at all.
+#
+# 3. CUDA. `pip install torch` gives you whatever CUDA build is default for your platform. If you
+#    need a specific one, install torch first from the PyTorch index and then run this file:
+#
+#      pip install torch --index-url https://download.pytorch.org/whl/cu124
+#      pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+# VERIFIED WORKING SET (the versions this code is actually run on):
+#   Python 3.11.15
+#   torch 2.11.0+cu130      numpy 2.4.3           safetensors 0.7.0
+#   pyfaidx 0.9.0.3         pyBigWig 0.3.25       einops 0.8.0
+#   alphagenome-pytorch 0.3.2.dev14+g6e3ace4a6
+# Lower bounds above are deliberately loose; if something breaks, match the set above.

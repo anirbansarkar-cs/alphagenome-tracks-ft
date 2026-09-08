@@ -1,0 +1,2 @@
+-r requirements.txt
+pytest>=8          # tests/test_losses.py also runs standalone: python tests/test_losses.py

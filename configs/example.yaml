@@ -1,0 +1,14 @@
+# Copy, edit the four paths, and pass them on the command line. This file is documentation:
+# the trainer takes flags, not YAML, so nothing here is parsed.
+checkpoint: /abs/path/alphagenome.safetensors
+windows:    /abs/path/windows.json
+manifest:   /abs/path/tracks.json
+fasta:      /abs/path/genome.fa
+
+organism_index: 0        # 0 = human, 1 = mouse
+trainable:      all      # head | head+decoder | all
+lr:             3e-4
+steps:          12000
+batch_size:     1
+bin_size:       1        # 128 skips the decoder and raises the track ceiling a lot
+workers:        4

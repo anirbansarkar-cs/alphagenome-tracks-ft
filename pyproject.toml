@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agtracks"
+version = "0.1.0"
+description = "Fine-tune AlphaGenome to predict multi-track coverage profiles at base resolution"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.2",
+    "numpy>=1.26",
+    "safetensors>=0.4",
+    "pyfaidx>=0.8",       # FASTA random access
+    "pyBigWig>=0.3.22",   # bigWig target reads
+]
+
+# The AlphaGenome trunk itself. Not on PyPI; install from source:
+#   pip install "alphagenome-pytorch @ git+https://github.com/genomicsxai/alphagenome-pytorch"
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agtracks"]
