@@ -7,6 +7,8 @@ name = "agtracks"
 version = "0.1.0"
 description = "Fine-tune AlphaGenome to predict multi-track coverage profiles at base resolution"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "torch>=2.2",

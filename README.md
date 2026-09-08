@@ -220,3 +220,16 @@ docs/           DATA_SCHEMA.md  GOTCHAS.md
 
 See `docs/DATA_SCHEMA.md` for the three input files and `docs/GOTCHAS.md` before debugging
 anything surprising.
+
+## Licence
+
+MIT, see `LICENSE`. Chosen to match
+[`alphagenome_FT_MPRA`](https://github.com/Al-Murphy/alphagenome_FT_MPRA), the fine-tuning work
+this descends from. The imported `alphagenome-pytorch` is Apache 2.0, which is permissive and
+places no constraint on this choice. No AlphaGenome code is copied: `src/agtracks/losses.py` is an
+independent implementation of the objective described in the paper's Methods, with their pseudocode
+quoted in a docstring for attribution.
+
+⚠️ **This licence does not cover model weights.** No weights are distributed here. If you later
+want to share a *fine-tuned checkpoint*, that is governed by the terms attached to the AlphaGenome
+weights you started from, not by this licence. Check those before distributing a trained artefact.
