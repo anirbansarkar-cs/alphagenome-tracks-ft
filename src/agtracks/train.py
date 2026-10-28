@@ -267,7 +267,11 @@ def main() -> int:
     ap.add_argument("--head-init-seed", type=int, default=-1,
                     help="RNG for AG row selection; -1 = use --seed.")
     ap.add_argument("--organism-embed-trainable", type=int, default=1, choices=[0, 1],
-                    help="keep organism_embed trainable even when the backbone is frozen. "
+                    help="1 = every organism_embed table trains, even when the backbone is "
+                         "frozen; 0 = every one is frozen, including the ROOT table (added to "
+                         "the trunk before the tower, so it is in no --trainable group and "
+                         "would otherwise train under every setting, pulling a tower backward "
+                         "into a 'head-only' run). "
                          "DEFAULT 1 AND THAT MATTERS: build_model widens the table 2->3 and "
                          "initialises row 2 as a COPY OF THE HUMAN ROW, so freezing it leaves "
                          "your species conditioned as whatever row you picked, with the "
@@ -436,31 +440,35 @@ def main() -> int:
             raise SystemExit(f"--trainable {args.trainable}: model has no module '{gname}'")
         for prm in mod.parameters():
             prm.requires_grad_(False)
-    # organism_embed lives in FOUR places (root + embedder_1bp/128bp/pair); re-enable them all
-    # after the sweep above, or freezing the embedders would silently take it down with them.
-    n_oe = 0
-    if args.organism_embed_trainable:
-        # ⚠️ SKIP embedder_pair. build_model freezes it ON PURPOSE: it feeds the contact-maps
-        # head, which we delete, so it NEVER RECEIVES A GRADIENT. Walking every module and
-        # re-enabling `organism_embed` silently undid that freeze. At world=1 the param merely
-        # sits in the optimizer and never updates (Adam creates no state for it -- which is how
-        # the resume smoke test surfaced this: 6/10 restored instead of 10/10). At world>1 it is
-        # fatal: DDP raises "Expected to have finished reduction" on params that get no grad.
-        _pair = getattr(model, "embedder_pair", None)
-        _pair_ids = {id(q) for q in _pair.parameters()} if _pair is not None else set()
-        for _m in model.modules():
-            _e = getattr(_m, "organism_embed", None)
-            if isinstance(_e, torch.nn.Embedding):
-                for prm in _e.parameters():
-                    if id(prm) in _pair_ids:
-                        continue
-                    prm.requires_grad_(True); n_oe += prm.numel()
+    # organism_embed lives in FOUR places (root + embedder_1bp/128bp/pair). Set every table
+    # explicitly, BOTH ways, after the sweep above: freezing the embedders would otherwise take
+    # theirs down with them, and the ROOT table (model.organism_embed) belongs to no group, so
+    # under "only re-enable when 1" it kept training with the flag at 0 under every --trainable.
+    # ⚠️ SKIP embedder_pair. build_model freezes it ON PURPOSE: it feeds the contact-maps
+    # head, which we delete, so it NEVER RECEIVES A GRADIENT. Walking every module and
+    # re-enabling `organism_embed` silently undid that freeze. At world=1 the param merely
+    # sits in the optimizer and never updates (Adam creates no state for it -- which is how
+    # the resume smoke test surfaced this: 6/10 restored instead of 10/10). At world>1 it is
+    # fatal: DDP raises "Expected to have finished reduction" on params that get no grad.
+    _pair = getattr(model, "embedder_pair", None)
+    _pair_ids = {id(q) for q in _pair.parameters()} if _pair is not None else set()
+    for _m in model.modules():
+        _e = getattr(_m, "organism_embed", None)
+        if isinstance(_e, torch.nn.Embedding):
+            for prm in _e.parameters():
+                if id(prm) in _pair_ids:
+                    continue
+                prm.requires_grad_(bool(args.organism_embed_trainable))
+    # count what ACTUALLY trains, after all freezing -- the log used to report the flag instead
+    n_oe = sum(prm.numel() for _m in model.modules()
+               if isinstance(getattr(_m, "organism_embed", None), torch.nn.Embedding)
+               for prm in _m.organism_embed.parameters() if prm.requires_grad)
     if lead:
         _tr = sum(p.numel() for p in list(model.parameters()) + list(head.parameters())
                   if p.requires_grad)
         _to = sum(p.numel() for p in list(model.parameters()) + list(head.parameters()))
         print(f"  --trainable={args.trainable}: froze {frozen_groups or '(nothing)'}; "
-              f"organism_embed trainable={bool(args.organism_embed_trainable)} ({n_oe} params)",
+              f"organism_embed trainable={n_oe > 0} ({n_oe} params)",
               flush=True)
         print(f"  TRAINABLE {_tr:,} / {_to:,} params ({100*_tr/_to:.2f}%)", flush=True)
     # ⚠️ NAME the trainable params. Adam's state_dict keys state by INDEX into param_groups, so
@@ -482,7 +490,10 @@ def main() -> int:
     param_names = [n for n, _ in _named]
     opt = torch.optim.Adam(params, lr=args.lr)
     if ddp:
-        model = DDP(model, device_ids=[local])
+        # DDP refuses a module with no trainable parameter, which is exactly the trunk under
+        # --trainable head --organism-embed-trainable 0; that trunk runs frozen and unwrapped.
+        if any(p.requires_grad for p in model.parameters()):
+            model = DDP(model, device_ids=[local])
         head = DDP(head, device_ids=[local])
 
     def loader(ds, shuffle):
@@ -541,7 +552,7 @@ def main() -> int:
               f"VALIDATION. Averaging validations does not widen this. See --help.", flush=True)
 
     dl_tr, dl_va = loader(tr, True), loader(va, False)
-    core = model.module if ddp else model
+    core = model.module if isinstance(model, DDP) else model
     hd = head.module if ddp else head
 
     crop = tr.crop
