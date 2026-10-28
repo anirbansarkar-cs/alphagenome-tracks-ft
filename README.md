@@ -113,7 +113,7 @@ runs at native 1 Mb on 4 GPUs in 53.94 GiB, with 42% headroom.
 ⚠️ **It buys capacity, not speed.** Throughput from world 2 to 4 measured **1.23×**, not 2×. So:
 
 - tracks fit on one GPU → plain single-GPU
-- want it faster and tracks already fit → **DDP** (`torchrun -m agtracks.train`)
+- want it faster and tracks already fit → **data parallel** (`torchrun -m agtracks.train`)
 - track count is the binding constraint → **sequence parallelism**
   (`torchrun -m agtracks.train_seqpar`)
 
@@ -135,15 +135,17 @@ torchrun --nproc_per_node=4 -m agtracks.train_seqpar \
     --steps 2000 --out runs/sp
 ```
 
-Three things to know before the first run:
+Four things to know before the first run:
 
-1. **`output_bp` must divide by the world size.** Each rank takes an equal slice of the output
-   positions, so a window index with `output_bp = 131072` works on 1, 2 or 4 GPUs but not 3. The
+1. **Input and output must be the same length** (`crop` 0 in the window index). Each rank
+   predicts its slice of the input and is scored on the same slice of the output.
+2. **`output_bp` must divide by the world size.** Each rank takes an equal slice of the output
+   positions, so a window index with `output_bp = 1048576` works on 1, 2 or 4 GPUs but not 3. The
    dataset raises a clear error rather than silently truncating.
-2. **Leave `--replicate-to` alone.** It fans the output channels out by *repeating* tracks, to
+3. **Leave `--replicate-to` alone.** It fans the output channels out by *repeating* tracks, to
    measure a capacity ceiling without needing that many real bigWigs. It defaults to off. Setting
    it trains on duplicated targets and the model is not meaningful.
-3. **`--overlap-high` must be a multiple of 128**, because the encoder downsamples the 1 bp shard
+4. **`--overlap-high` must be a multiple of 128**, because the encoder downsamples the 1 bp shard
    by 128 before the gather trims in the 128 bp domain. The low-resolution overlap is derived from
    it automatically, so there is one number to set, not two. It raises if you get it wrong.
 
@@ -168,8 +170,8 @@ to get wrong and neither fails loudly.
    track chunks, which is exactly equivalent because a mean over all channels equals the
    size-weighted mean of per-chunk means.
 
-Predictions are also clamped before the implicit `exp()`: with a randomly-initialised head the raw
-values overflow fp32 and give `inf` loss with `NaN` gradients.
+`train_seqpar` uses a per-position Poisson loss on the head's rate, not the AlphaGenome loss in
+`agtracks.train`, so losses from the two trainers are not comparable.
 
 **Your bottleneck will probably be I/O, not the GPU.** Before staging bigWigs to local tmpfs, a
 1 Mb training step here was 86% data loading — 11.0 s of a 12.8 s step. Fixing that alone was an

@@ -29,8 +29,8 @@ TWO DESIGN POINTS that are easy to get wrong if you reimplement it:
      over track chunks, which is mathematically identical because a mean over all channels equals
      the size-weighted mean of per-chunk means.
 
-Predictions are clamped before the implicit exp(): with a randomly-initialised head the raw values
-overflow fp32 and give inf loss with NaN gradients.
+LOSS: a per-position Poisson NLL on the head's output, which is already a rate (softplus >= 0).
+It is not agtracks.train's AlphaGenome loss, so the two trainers' losses are not comparable.
 
 CORRECTNESS. The sharded and unsharded forward passes were compared directly: loss exact to
 1.3e-6 and gradient cosine 0.9996, with the worst case 2.7e-2 relative on tower attention biases
@@ -40,8 +40,9 @@ data and schedule on one GPU so the loss trajectories can be compared.
    Adam normalises by gradient magnitude -- weight 1-cos went 2e-09 at 150 steps to 7.7e-06 at 600.
    Compare validation METRICS.
 
-REQUIREMENT ON GEOMETRY: the window index's `output_bp` must be divisible by the world size,
-because each rank takes an equal slice of the output positions. The dataset raises if it is not.
+REQUIREMENTS ON GEOMETRY: the window index must have `input_bp == output_bp` (crop 0), because
+each rank predicts its slice of the input and is scored on the same slice of the output; and
+`output_bp` must be divisible by the world size. Both are checked at start.
 
 Launch (4 GPUs, sequence-parallel):
     torchrun --nproc_per_node=4 -m agtracks.train_seqpar \
@@ -64,18 +65,20 @@ import os
 import time
 from pathlib import Path
 
+# must be set before torch initialises CUDA (see docs/GOTCHAS.md); an explicit setting wins
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-LOGIT_CLAMP = 15.0
 TRACK_CHUNK = 512
 
 
-def chunked_poisson(pred, y_uniq, idx, clamp=LOGIT_CLAMP):
-    """Mean Poisson NLL of `pred` (B,S,T) against y_uniq (B,S,U) fanned out through idx (T,).
+def chunked_poisson(pred, y_uniq, idx):
+    """Mean Poisson NLL of the rate `pred` (B,S,T) against y_uniq (B,S,U) fanned out through idx (T,).
 
     Accumulated over track chunks so the expanded target never exists in full. The chunk means
     are combined size-weighted, which equals the mean over all T channels exactly.
@@ -85,8 +88,8 @@ def chunked_poisson(pred, y_uniq, idx, clamp=LOGIT_CLAMP):
     for a in range(0, T, TRACK_CHUNK):
         b = min(a + TRACK_CHUNK, T)
         tgt = y_uniq.index_select(-1, idx[a:b])
-        p = pred[..., a:b].float().clamp(-clamp, clamp)
-        total = total + F.poisson_nll_loss(p, tgt, log_input=True, reduction="mean") * (b - a)
+        p = pred[..., a:b].float()
+        total = total + F.poisson_nll_loss(p, tgt, log_input=False, reduction="mean") * (b - a)
         seen += b - a
     return total / seen
 
@@ -101,8 +104,8 @@ def main() -> int:
                     required=True)
     ap.add_argument("--checkpoint", type=Path,
                     required=True)
-    ap.add_argument("--organism-index", type=int, default=3)
-    ap.add_argument("--num-organisms", type=int, default=4)
+    ap.add_argument("--organism-index", type=int, default=2)
+    ap.add_argument("--num-organisms", type=int, default=3)
     ap.add_argument("--replicate-to", type=int, default=None,
                     help="BENCHMARKING ONLY. Fan the output channels out to this many by "
                          "REPEATING tracks, to measure a capacity ceiling without needing "
@@ -161,10 +164,11 @@ def main() -> int:
     if seqpar or args.ddp:
         dist.init_process_group("nccl")
         rank, world = dist.get_rank(), dist.get_world_size()
-        torch.cuda.set_device(rank)
+        local = int(os.environ.get("LOCAL_RANK", 0))
     else:
-        rank, world = 0, 1
-    dev = f"cuda:{rank}"
+        rank, world, local = 0, 1, 0
+    torch.cuda.set_device(local)
+    dev = f"cuda:{local}"
     lead = rank == 0
 
     from agtracks.dataset import GenomeWindowDataset
@@ -186,6 +190,9 @@ def main() -> int:
     # window file's length while telling sequence parallelism to trim to another -- which is
     # exactly how arm B died (target 524,288 vs embeddings 131,072) and why arm A's memory
     # looked anomalous (it was 1 Mb all along, not the 262 kb the flag claimed).
+    if ds.crop:
+        raise SystemExit(f"{Path(args.windows).name} has input {ds.input_bp:,} bp and output "
+                         f"{ds.output_bp:,} bp; train_seqpar needs them equal (crop 0).")
     if args.seq_len != ds.input_bp:
         raise SystemExit(
             f"--seq-len {args.seq_len:,} disagrees with the window index ({ds.input_bp:,} bp "
@@ -292,14 +299,16 @@ def main() -> int:
                 pv = head({1: e1v}, org, return_scaled=True, channels_last=True)[1]
             # compare on the UNIQUE tracks only: replicated channels are copies and would just
             # repeat the same correlation T/n_uniq times, inflating nothing but the count
-            Ps.append(torch.exp(pv[..., :n_uniq].float()).squeeze(0).cpu())
+            Ps.append(pv[..., :n_uniq].float().squeeze(0).cpu())
             Ys.append(yv.squeeze(0).cpu())
         model.train(); head.train()
         if not Ys:
             return {}
         Y = torch.cat(Ys, 0).double()                 # (N*L_shard, U)
         P = torch.cat(Ps, 0).double()
-        M = torch.stack(Ys, 0).double().mean(0).repeat(len(Ys), 1)   # mean profile baseline
+        # mean-profile baseline, leave-one-out: each window is predicted by the mean of the others
+        Ystk = torch.stack(Ys, 0).double()
+        M = ((Ystk.sum(0, keepdim=True) - Ystk) / max(len(Ys) - 1, 1)).reshape(-1, Ystk.shape[-1])
 
         def reduce_(t):
             if seqpar:

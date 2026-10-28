@@ -8,7 +8,7 @@ Usage:
     python -m agtracks.train --checkpoint AG.safetensors \
         --windows W.json --manifest M.json --fasta genome.fa \
         --organism-index 0 --trainable all --lr 3e-4 --steps 18000 --out runs/my_run
-    torchrun --nproc_per_node=4 -m agtracks.train ...     # DDP
+    torchrun --nproc_per_node=4 -m agtracks.train ...     # data parallel
     python -m agtracks.train --smoke ...                  # a few steps, sanity only
 
 `--organism-index`: AlphaGenome ships two organism rows, **0 = human, 1 = mouse**. Rows past
@@ -198,7 +198,6 @@ def main() -> int:
     import numpy as np
     import torch
     import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
     from agtracks.dataset import GenomeWindowDataset
 
     ap = argparse.ArgumentParser()
@@ -475,11 +474,11 @@ def main() -> int:
     param_names = [n for n, _ in _named]
     opt = torch.optim.Adam(params, lr=args.lr)
     if ddp:
-        # DDP refuses a module with no trainable parameter (the trunk under --trainable head
-        # --organism-embed-trainable 0), so that trunk stays unwrapped
-        if any(p.requires_grad for p in model.parameters()):
-            model = DDP(model, device_ids=[local])
-        head = DDP(head, device_ids=[local])
+        # Data parallel without a DDP wrapper: start every rank from rank 0's weights (the new
+        # head is initialised per rank), then average gradients after each backward.
+        with torch.no_grad():
+            for _t in [*model.parameters(), *model.buffers(), *head.parameters(), *head.buffers()]:
+                dist.broadcast(_t.data, 0)
 
     class EpochSampler(torch.utils.data.Sampler):
         """Shuffles once per epoch, seeded by --seed and the epoch. Under DDP rank r takes every
@@ -558,8 +557,7 @@ def main() -> int:
     if bpe == 0:
         raise SystemExit(f"train split ({len(tr)} windows) is smaller than one batch "
                          f"({args.batch_size} x {world} ranks)")
-    core = model.module if isinstance(model, DDP) else model
-    hd = head.module if ddp else head
+    core, hd = model, head
 
     crop = tr.crop
     out_bp = tr.output_bp
@@ -815,6 +813,11 @@ def main() -> int:
                 pl = forward(x, org).float()
                 loss, loss_parts = compute_loss(pl, y, widx)
             loss.backward()
+            if ddp:
+                for p in params:
+                    if p.grad is not None:
+                        dist.all_reduce(p.grad)
+                        p.grad.div_(world)
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step()
             step += 1
