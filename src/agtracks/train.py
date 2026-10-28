@@ -11,8 +11,8 @@ Usage:
     torchrun --nproc_per_node=4 -m agtracks.train ...     # DDP
     python -m agtracks.train --smoke ...                  # a few steps, sanity only
 
-`--organism-index`: AlphaGenome ships two organism rows, **0 = human, 1 = mouse**. Pick the one
-your data is. A third species needs a wider embedding table than the published checkpoint has.
+`--organism-index`: AlphaGenome ships two organism rows, **0 = human, 1 = mouse**. Rows past
+those (`--num-organisms 3`, the default, adds row 2) start as copies of the human row.
 
 `--steps` is ABSOLUTE and `--resume` restores optimizer state and the step counter, so budgets
 chain: run to 6000, then resume the same run with --steps 12000 to continue rather than restart.
@@ -26,6 +26,9 @@ import os
 import sys
 import time
 from pathlib import Path
+
+# must be set before torch initialises CUDA (see docs/GOTCHAS.md); an explicit setting wins
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -68,12 +71,12 @@ def build_model(num_tracks: int, num_organisms: int, checkpoint: Path | None,
             "uninitialised model trains with no normalisation and reports no error. "
             "Pass --checkpoint.")
     sd = load_file(str(checkpoint))
+    # the published checkpoint has 2 organism rows; extra rows start as copies of row 0 (human)
+    for k in [k for k in sd if "organism_embed" in k]:
+        n = sd[k].shape[0]
+        if n < num_organisms:
+            sd[k] = torch.cat([sd[k], sd[k][:1].repeat(num_organisms - n, *[1] * (sd[k].dim() - 1))])
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    got = [k for k in sd if "organism_embed" in k]
-    for k in got:
-        if sd[k].shape[0] < num_organisms:
-            raise SystemExit(f"{k} has {sd[k].shape[0]} organism rows, need {num_organisms}; "
-                             f"run expand_organism_embedding.py")
     print(f"  loaded {len(sd)} tensors; {len(missing)} missing, {len(unexpected)} unexpected")
 
     model.heads = nn.ModuleDict()
@@ -112,8 +115,8 @@ def init_head_from_ag(head, tracks, checkpoint, seed=0, verbose=True):
     AG's HUMAN row (organism 0) into ALL of our organism rows -- the same convention build_model
     already uses when it widens organism_embed.
 
-    ⚠️ `track_means` is deliberately NOT copied: it is a buffer already holding OUR per-track
-    means, and overwriting it with AG's human means would silently rescale every target.
+    ⚠️ `track_means` is deliberately NOT copied: our targets are scaled by our own track means
+    in the training loop.
     """
     import random
     import torch
@@ -125,7 +128,7 @@ def init_head_from_ag(head, tracks, checkpoint, seed=0, verbose=True):
     groups: dict[str, list[int]] = {}
     for i, t in enumerate(tracks):
         a = str(t.get("assay", "")).upper()
-        name = next((v for k, v in AG_HEAD_FOR_ASSAY.items() if a.startswith(k)), None)
+        name = next((v for k, v in AG_HEAD_FOR_ASSAY.items() if k in a), None)
         if name is None:
             raise SystemExit(f"--head-init ag: track {i} assay {t.get('assay')!r} maps to no AG head")
         groups.setdefault(name, []).append(i)
@@ -134,10 +137,12 @@ def init_head_from_ag(head, tracks, checkpoint, seed=0, verbose=True):
     picked: dict[int, tuple[str, int]] = {}
     for name in sorted(groups):
         idxs = groups[name]
-        n_rows = sd[f"heads.{name}.convs.128.weight"].shape[1]
-        if len(idxs) > n_rows:
-            raise SystemExit(f"--head-init ag: need {len(idxs)} rows from AG head {name}, has {n_rows}")
-        for i, r in zip(idxs, rng.sample(range(n_rows), len(idxs))):
+        # AG pads each head with unused rows (track_mean 0, near-zero weights); never pick those
+        real = (sd[f"heads.{name}.track_means"][0] > 0).nonzero().flatten().tolist()
+        if len(idxs) > len(real):
+            raise SystemExit(f"--head-init ag: need {len(idxs)} rows from AG head {name}, "
+                             f"has {len(real)}")
+        for i, r in zip(idxs, rng.sample(real, len(idxs))):
             picked[i] = (name, r)
 
     for res in ("1", "128"):
@@ -241,24 +246,15 @@ def main() -> int:
                          "'all' = E5 full fine-tuning, and the historical default, so existing "
                          "recipes are unchanged. E4 runs these in sequence from one checkpoint.")
     ap.add_argument("--val-select", choices=["prefix", "spread", "rotate"], default="rotate",
-                    help="WHICH val windows to score. 🚨 `prefix` -- the historical behaviour and "
-                         "still the default -- scores the FIRST --val-batches windows of the "
-                         "split, THE SAME ONES EVERY VALIDATION (the loader is shuffle=False and "
-                         "validate() breaks early). At batch-size 1 that is 8 loci, 0.11%% of "
-                         "W1a's split and 2.7%% of the 1 Mb split, and averaging validations does "
-                         "NOT widen it. It is why W1a's 1 Mb 'win' was real-looking: arms with "
-                         "different window indices start at different genomic positions, and the "
-                         "4k and 1 Mb arms shared ZERO of their 8 windows. "
-                         "`spread` takes --val-batches windows evenly spaced across the whole "
-                         "split (deterministic, identical every validation and across arms that "
-                         "share an index) -- same cost, representative loci. "
-                         "`rotate` advances the spread block each validation, so a 60-validation "
-                         "run covers many distinct loci and an average over the last 20 rests on "
-                         "20x the loci -- best coverage, noisier per validation. "
-                         "⚠️ DEFAULT LEFT AT `prefix` ON PURPOSE: E4 spawns a fresh process per "
-                         "phase, so flipping the default mid-run would give one staged run P1 on "
-                         "one sampling rule and P2/P3 on another. Cut over deliberately, and "
-                         "note that histories across the change are NOT comparable.")
+                    help="which val windows to score. "
+                         "`prefix`: the first --val-batches windows of the split, the same ones "
+                         "every validation (few loci, not representative). "
+                         "`spread`: --val-batches windows evenly spaced across the split, the "
+                         "same ones every validation. "
+                         "`rotate` (default): the spread set shifted by one window each "
+                         "validation, so successive validations cover different loci; best.pt is "
+                         "then picked on a different set each time. Use `spread` when best.pt "
+                         "should be chosen on a fixed set.")
     ap.add_argument("--head-init", choices=["random", "ag"], default="random",
                     help="random = E2's control. ag = E1a/E1b: seed the track head from "
                          "AlphaGenome's pretrained head rows, assay-matched, rows drawn by a "
@@ -268,10 +264,7 @@ def main() -> int:
                     help="RNG for AG row selection; -1 = use --seed.")
     ap.add_argument("--organism-embed-trainable", type=int, default=1, choices=[0, 1],
                     help="1 = every organism_embed table trains, even when the backbone is "
-                         "frozen; 0 = every one is frozen, including the ROOT table (added to "
-                         "the trunk before the tower, so it is in no --trainable group and "
-                         "would otherwise train under every setting, pulling a tower backward "
-                         "into a 'head-only' run). "
+                         "frozen; 0 = every one is frozen. "
                          "DEFAULT 1 AND THAT MATTERS: build_model widens the table 2->3 and "
                          "initialises row 2 as a COPY OF THE HUMAN ROW, so freezing it leaves "
                          "your species conditioned as whatever row you picked, with the "
@@ -314,9 +307,8 @@ def main() -> int:
     if args.smoke:
         args.steps, args.val_every, args.val_batches = 12, 6, 4
 
-    # SEED EVERYTHING that varies between otherwise-identical runs: the new head's init, the
-    # training window order, and any dropout. Under DDP each rank gets seed+rank so ranks do not
-    # draw identical data order, while the run as a whole stays reproducible from --seed.
+    # Seed the new head's init and any dropout. Under DDP each rank gets seed+rank; rank 0's
+    # weights are broadcast before training, and the window order comes from EpochSampler.
     import random as _random
     _rank = int(os.environ.get("RANK", 0))
     torch.manual_seed(args.seed + _rank)
@@ -440,16 +432,9 @@ def main() -> int:
             raise SystemExit(f"--trainable {args.trainable}: model has no module '{gname}'")
         for prm in mod.parameters():
             prm.requires_grad_(False)
-    # organism_embed lives in FOUR places (root + embedder_1bp/128bp/pair). Set every table
-    # explicitly, BOTH ways, after the sweep above: freezing the embedders would otherwise take
-    # theirs down with them, and the ROOT table (model.organism_embed) belongs to no group, so
-    # under "only re-enable when 1" it kept training with the flag at 0 under every --trainable.
-    # ⚠️ SKIP embedder_pair. build_model freezes it ON PURPOSE: it feeds the contact-maps
-    # head, which we delete, so it NEVER RECEIVES A GRADIENT. Walking every module and
-    # re-enabling `organism_embed` silently undid that freeze. At world=1 the param merely
-    # sits in the optimizer and never updates (Adam creates no state for it -- which is how
-    # the resume smoke test surfaced this: 6/10 restored instead of 10/10). At world>1 it is
-    # fatal: DDP raises "Expected to have finished reduction" on params that get no grad.
+    # organism_embed lives in the root model and in each embedder. Set every table to the flag
+    # here: the root one is in no --trainable group. Skip embedder_pair, which build_model
+    # freezes because it feeds the deleted contact-maps head and never gets a gradient.
     _pair = getattr(model, "embedder_pair", None)
     _pair_ids = {id(q) for q in _pair.parameters()} if _pair is not None else set()
     for _m in model.modules():
@@ -459,7 +444,7 @@ def main() -> int:
                 if id(prm) in _pair_ids:
                     continue
                 prm.requires_grad_(bool(args.organism_embed_trainable))
-    # count what ACTUALLY trains, after all freezing -- the log used to report the flag instead
+    # count what actually trains, not what the flag asked for
     n_oe = sum(prm.numel() for _m in model.modules()
                if isinstance(getattr(_m, "organism_embed", None), torch.nn.Embedding)
                for prm in _m.organism_embed.parameters() if prm.requires_grad)
@@ -490,17 +475,32 @@ def main() -> int:
     param_names = [n for n, _ in _named]
     opt = torch.optim.Adam(params, lr=args.lr)
     if ddp:
-        # DDP refuses a module with no trainable parameter, which is exactly the trunk under
-        # --trainable head --organism-embed-trainable 0; that trunk runs frozen and unwrapped.
+        # DDP refuses a module with no trainable parameter (the trunk under --trainable head
+        # --organism-embed-trainable 0), so that trunk stays unwrapped
         if any(p.requires_grad for p in model.parameters()):
             model = DDP(model, device_ids=[local])
         head = DDP(head, device_ids=[local])
 
-    def loader(ds, shuffle):
-        from torch.utils.data import DataLoader, DistributedSampler
-        samp = DistributedSampler(ds, shuffle=shuffle) if ddp else None
-        return DataLoader(ds, batch_size=args.batch_size, shuffle=(shuffle and samp is None),
-                          sampler=samp, num_workers=args.workers, pin_memory=True,
+    class EpochSampler(torch.utils.data.Sampler):
+        """Shuffles once per epoch, seeded by --seed and the epoch. Under DDP rank r takes every
+        world-th window. `skip` starts mid-epoch, so a resumed run continues the same order."""
+        def __init__(self, n):
+            self.n = n
+            self.n_used = n // (world * args.batch_size) * world * args.batch_size
+            self.epoch, self.skip = 0, 0
+
+        def __iter__(self):
+            g = torch.Generator().manual_seed(args.seed + self.epoch)
+            idx = torch.randperm(self.n, generator=g)[:self.n_used][rank::world]
+            return iter(idx[self.skip:].tolist())
+
+        def __len__(self):
+            return self.n_used // world - self.skip
+
+    def loader(ds, sampler=None):
+        from torch.utils.data import DataLoader
+        return DataLoader(ds, batch_size=args.batch_size, sampler=sampler,
+                          num_workers=args.workers, pin_memory=True,
                           drop_last=True, persistent_workers=args.workers > 0)
 
     # ---- gene-level ACROSS-TISSUE loss setup -------------------------------------------
@@ -551,7 +551,13 @@ def main() -> int:
               f"({100*_n_val_w/max(len(va),1):.2f}% of the split), THE SAME ONES EVERY "
               f"VALIDATION. Averaging validations does not widen this. See --help.", flush=True)
 
-    dl_tr, dl_va = loader(tr, True), loader(va, False)
+    # every rank validates the same windows; only rank 0 reports
+    samp_tr = EpochSampler(len(tr))
+    dl_tr, dl_va = loader(tr, samp_tr), loader(va)
+    bpe = len(dl_tr)
+    if bpe == 0:
+        raise SystemExit(f"train split ({len(tr)} windows) is smaller than one batch "
+                         f"({args.batch_size} x {world} ranks)")
     core = model.module if isinstance(model, DDP) else model
     hd = head.module if ddp else head
 
@@ -774,6 +780,8 @@ def main() -> int:
                 hist = [h for h in json.loads(hp.read_text()) if h.get("step", 0) <= step]
             except Exception:
                 hist = []
+        # keep best.pt's bar from the run so far, or the first validation would overwrite it
+        best_r = max((h["r_model_median"] for h in hist), default=float("-inf"))
         if lead:
             print(f"  RESUMED from {args.resume} at step {step}: "
                   f"{restored}/{len(param_names)} params got their Adam moments back, "
@@ -787,7 +795,10 @@ def main() -> int:
     if lead:
         print("step | loss | val r(model) | val r(mean-profile) | tracks beating baseline",
               flush=True)
+    step0 = step
+    epoch, skip = divmod(step, bpe)       # continue the data order where a resumed run stopped
     while step < args.steps:
+        samp_tr.epoch, samp_tr.skip = epoch, skip * args.batch_size
         for batch in dl_tr:
             if step >= args.steps:
                 break
@@ -818,7 +829,7 @@ def main() -> int:
                 # magnitude anchor or the tissue term is doing anything.
                 pstr = "  ".join(f"{k}={v:+.4e}" for k, v in loss_parts.items())
                 print(f"  step {step:>5}  loss={loss.item():.4f}  {pstr}  "
-                      f"{(time.time()-t0)/step:.2f}s/step  "
+                      f"{(time.time()-t0)/(step-step0):.2f}s/step  "
                       f"PEAK_GPU_GIB={peak:.2f} reserved={resv:.2f}", flush=True)
             if step % args.val_every == 0 or step == args.steps:
                 m = validate()
@@ -840,6 +851,7 @@ def main() -> int:
                         save_ckpt(args.out / "best.pt", step, m)
                         print(f"        new best r_model={best_r:.4f} at step {step} -> best.pt",
                               flush=True)
+        epoch, skip = epoch + 1, 0
     if lead:
         save_ckpt(args.out / "last.pt", step, hist[-1] if hist else None)
         print(f"\ndone in {(time.time()-t0)/60:.1f} min -> {args.out}")

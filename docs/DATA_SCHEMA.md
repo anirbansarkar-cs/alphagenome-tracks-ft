@@ -24,7 +24,8 @@ JSON. Carries the geometry and the train/val/test split, so the loader never re-
 - **Put the split here, not in your loader.** Whole-chromosome splits make the leakage rule
   structural; anything else needs the input-window overlap rule applied when the index is built.
 
-`scripts/build_window_index.py` builds one from a FASTA, with `--val-chroms` / `--test-chroms` for
+`scripts/build_window_index.py` builds one from a chromosome registry (FASTA path and chromosome
+lengths; format in the script's docstring), with `--val-chroms` / `--test-chroms` for
 chromosome-level splits, or `--sections N` for AlphaGenome-style within-chromosome splits that drop
 any val/test window whose 1 Mb *input* window overlaps a training window's input.
 
@@ -39,7 +40,6 @@ JSON list, one entry per output channel. Channel order is manifest order.
    "path":     "/abs/path/dnase_rep1.bw",
    "tissue":   "leaf",
    "track_mean": 1.842,
-   "contig_style": "chr",
    "is_control": false}
 ]
 ```
@@ -47,18 +47,17 @@ JSON list, one entry per output channel. Channel order is manifest order.
 | field | required | purpose |
 |---|---|---|
 | `track_id` | yes | identity, used in reports |
-| `assay` | yes | groups tracks into strata for per-assay scoring |
+| `assay` | yes | groups tracks into strata for per-assay scoring; names containing `ATAC`, `DNase` or `RNA` (any case) are read as those assays |
 | `path` (or `local`) | yes | absolute path to the bigWig |
 | `track_mean` | recommended | genome-wide mean, used to normalise targets. Missing or ≤0 falls back to 1.0, which silently changes what the model fits |
-| `contig_style` | if needed | how this track names chromosomes, e.g. `chr` vs bare |
 | `tissue`, `is_control` | optional | carried through to reports |
 
 **Use absolute paths.** A relative path resolves against whatever the working directory happens to
 be, which fails quietly by loading the wrong file rather than none.
 
-**`contig_style` is per track, not per manifest.** Sources disagree: `1`, `chr1`, `Chr01`. A track
-whose chromosome cannot be resolved is a hard error, never a silently-skipped block of zeros. This
-is the most common source of quiet corruption.
+**Chromosome names are resolved per track.** Sources disagree: `1`, `chr1`, `Chr01`, `chrom1` all
+map to `1` (`agtracks.dataset.norm_contig`; extend `CONTIG_PREFIXES` for other prefixes). A track
+whose chromosome cannot be resolved is a hard error, never a silently-skipped block of zeros.
 
 ## 3. Reference FASTA — `--fasta`
 
@@ -69,6 +68,8 @@ loader keyed on species alone would serve the wrong sequence and never raise.
 ## 4. `--organism-index`
 
 `0` for human, `1` for mouse. These are the two rows the published AlphaGenome checkpoint ships.
+Rows past these (`--num-organisms 3`, the default, adds row 2) start as copies of the human row,
+so `--organism-index 2` gives a new species its own row.
 
 ## Targets
 

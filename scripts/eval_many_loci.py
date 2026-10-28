@@ -70,7 +70,7 @@ def main() -> int:
                          "score are NOT comparable -- pooling removes fine-scale noise and "
                          "inflates r, which flatters whichever side is pooled. Pool both or "
                          "compare neither.")
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
 
     import sys; sys.path.insert(0, str(Path(__file__).parent))
@@ -236,7 +236,7 @@ def main() -> int:
            "track_labels": [{"i": i, "assay": x.get("assay"), "tissue": x.get("tissue"),
                              "study": x.get("study"), "track_id": x.get("track_id")}
                             for i, x in enumerate(ds.tracks[:Teff])]}
-    out = a.out or (None)
+    out = a.out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=1))
     print(json.dumps(res, indent=1), flush=True)

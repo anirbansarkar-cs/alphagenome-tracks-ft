@@ -20,17 +20,25 @@ Three things this settles, each of which is a silent-failure risk if left to the
    quietly absorbed.
 
 Usage:
-    python build_window_index.py --input-bp 16384 --output-bp 8192
-    python build_window_index.py --sections 8          # AG-style within-chromosome folds
+    python build_window_index.py --registry registry.json --assembly NAME \
+        --input-bp 16384 --output-bp 8192 --out windows.json
+    python build_window_index.py ... --sections 8      # AG-style within-chromosome folds
+
+The registry is JSON: {"<any key>": {"assembly": NAME, "fasta": "/abs/genome.fa",
+"chromosomes": {"1": 30427671, "2": 19698289, ...}}}. Chromosome names are bare (`1`, not
+`chr1`); FASTA headers are matched to them with agtracks.dataset.norm_contig.
 """
 
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import json
+import re
 from pathlib import Path
 
+from agtracks.dataset import norm_contig as _norm
 
 
 def load_chromosomes(registry: Path, assembly: str) -> tuple[dict[str, int], str]:
@@ -41,17 +49,10 @@ def load_chromosomes(registry: Path, assembly: str) -> tuple[dict[str, int], str
     raise SystemExit(f"assembly {assembly!r} not in {registry}")
 
 
-def _norm(name: str) -> str:
-    """`chr1`/`Chr01`/`1` -> `1`. Same rule as agtracks.dataset.norm_contig."""
-    import re
-    n = re.sub(r"^(chr|bd)", "", name.strip().lower())
-    return n.lstrip("0") or n
-
-
-def n_profile(fasta: Path, chroms: dict[str, int], bin_bp: int) -> dict[str, list[int]]:
-    """Count ambiguous bases per bin, per chromosome. One pass over the FASTA."""
+def n_runs(fasta: Path, chroms: dict[str, int]) -> dict[str, list[list[int]]]:
+    """Runs of ambiguous bases as [start, end) intervals, per chromosome. One pass over the FASTA."""
     want = set(chroms)
-    prof = {c: [0] * (chroms[c] // bin_bp + 1) for c in chroms}
+    runs: dict[str, list[list[int]]] = {c: [] for c in chroms}
     cur, pos = None, 0
     # Accept EITHER a gzipped or a plain FASTA. Many assemblies ship as .fa.gz; some are kept
     # uncompressed because pyfaidx needs plain or BGZF, and a second 950 MB gzipped copy purely
@@ -75,19 +76,30 @@ def n_profile(fasta: Path, chroms: dict[str, int], bin_bp: int) -> dict[str, lis
                 continue
             s = line.strip().upper()
             if "N" in s:
-                # attribute Ns to bins; lines are short so per-line granularity is fine
-                for i, ch in enumerate(s):
-                    if ch == "N":
-                        b = (pos + i) // bin_bp
-                        if b < len(prof[cur]):
-                            prof[cur][b] += 1
+                r = runs[cur]
+                for m in re.finditer("N+", s):
+                    a, b = pos + m.start(), pos + m.end()
+                    if r and r[-1][1] == a:            # run continues from the previous line
+                        r[-1][1] = b
+                    else:
+                        r.append([a, b])
             pos += len(s)
-    return prof
+    return runs
+
+
+def n_count(runs: list[list[int]], starts: list[int], ends: list[int], cum: list[int],
+            a: int, b: int) -> int:
+    """Ambiguous bases in [a, b), from sorted non-overlapping runs and their cumulative lengths."""
+    i, j = bisect.bisect_right(ends, a), bisect.bisect_left(starts, b)
+    if i >= j:
+        return 0
+    return cum[j] - cum[i] - max(0, a - starts[i]) - max(0, ends[j - 1] - b)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--registry", type=Path, default=None)
+    ap.add_argument("--registry", type=Path, required=True,
+                    help="JSON with each assembly's FASTA and chromosome lengths (see docstring)")
     ap.add_argument("--assembly", required=True,
                     help="assembly name, recorded in the index so a loader can key on it")
     ap.add_argument("--input-bp", type=int, default=16384)
@@ -112,6 +124,13 @@ def main() -> int:
     stride = args.stride or args.output_bp
 
     chroms, fasta = load_chromosomes(args.registry, args.assembly)
+    args.val_chroms = [_norm(c) for c in args.val_chroms]
+    args.test_chroms = [_norm(c) for c in args.test_chroms]
+    unknown = sorted(set(args.val_chroms + args.test_chroms) - set(chroms))
+    if unknown and not args.sections:
+        # a typo here would silently put that chromosome into training
+        raise SystemExit(f"--val-chroms/--test-chroms {unknown} are not in the registry: "
+                         f"{sorted(chroms)}")
     print(f"assembly {args.assembly}: {len(chroms)} chromosomes, "
           f"{sum(chroms.values()):,} bp")
     print(f"input {args.input_bp:,}  output {args.output_bp:,}  crop {crop:,} each side")
@@ -119,20 +138,23 @@ def main() -> int:
           f"{' (OVERLAPPING, AlphaGenome-style)' if stride < args.output_bp else ''}\n")
 
     print("scanning FASTA for assembly gaps (N runs)...", flush=True)
-    prof = n_profile(Path(fasta), chroms, args.output_bp)
+    runs = n_runs(Path(fasta), chroms)
 
     windows, dropped_n, dropped_edge = [], 0, 0
     for c, length in chroms.items():
-        nbins = len(prof[c])
+        rc = runs[c]
+        starts, ends = [r[0] for r in rc], [r[1] for r in rc]
+        cum = [0]
+        for s_, e_ in rc:
+            cum.append(cum[-1] + e_ - s_)
         for k in range((length - args.output_bp) // stride + 1):
             out_start = k * stride
             in_start, in_end = out_start - crop, out_start + args.output_bp + crop
             if in_start < 0 or in_end > length:
                 dropped_edge += 1          # input window would run off the chromosome
                 continue
-            b = out_start // args.output_bp
-            ncount = prof[c][b] if b < nbins else 0
-            if ncount / args.output_bp > args.max_n_frac:
+            # N fraction over the whole INPUT span, as the docstring says
+            if n_count(rc, starts, ends, cum, in_start, in_end) / args.input_bp > args.max_n_frac:
                 dropped_n += 1
                 continue
             windows.append({"chrom": c, "out_start": out_start,

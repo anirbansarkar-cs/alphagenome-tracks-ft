@@ -12,7 +12,7 @@ Three checks exist because the corresponding mistake is easy to make and fails s
    the wrong sequence for some tracks and never raise.
 
 2. CONTIG NAMES ARE PER TRACK, NOT PER SPECIES. One source may use `1..22`, another `chr1..chr22`,
-   another `Chr01..Chr22`. The manifest carries `contig_style` per track for exactly this reason,
+   another `Chr01..Chr22`. Each track's names are resolved separately through `norm_contig`,
    and a track whose chromosome cannot be resolved is a HARD ERROR rather than a silently-skipped
    block of zeros. Contig naming is the single most common source of quiet corruption here.
 
@@ -46,7 +46,9 @@ def norm_contig(name: str) -> str:
     Extend CONTIG_PREFIXES if your assembly uses a different prefix. Anything unmatched is
     returned lowercased and zero-stripped, so `X`/`Y`/`MT` pass through unchanged.
     """
-    n = re.sub(r"^(" + "|".join(CONTIG_PREFIXES) + r")", "", name.strip().lower())
+    # longest prefix first, so `chrom1` loses `chrom`, not just `chr`
+    pre = sorted(CONTIG_PREFIXES, key=len, reverse=True)
+    n = re.sub(r"^(" + "|".join(pre) + r")", "", name.strip().lower())
     return n.lstrip("0") or n
 
 
@@ -204,7 +206,7 @@ class GenomeWindowDataset:
         if canon not in m:
             raise KeyError(
                 f"track {path} has no contig matching canonical {canon!r}; "
-                f"has {sorted(m)[:6]}. Contig naming differs PER TRACK -- check contig_style.")
+                f"has {sorted(m)[:6]}. Extend CONTIG_PREFIXES if this naming is not covered.")
         return m[canon]
 
     def __len__(self) -> int:

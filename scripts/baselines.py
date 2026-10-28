@@ -44,7 +44,8 @@ def main() -> int:
     ap.add_argument("--n-loci", type=int, default=96)
     ap.add_argument("--pos-per-locus", type=int, default=6000)
     ap.add_argument("--loci-seed", type=int, default=0)
-    ap.add_argument("--track-subset", type=int, default=48)
+    ap.add_argument("--track-subset", type=int, default=0,
+                    help="score only the first N tracks, as eval_many_loci.py; 0 = all")
     ap.add_argument("--pool-bp", type=int, default=1,
                     help="average targets down the POSITION axis by this factor before the "
                          "baselines are built and before any statistic. 1 = native (default), "
@@ -52,7 +53,7 @@ def main() -> int:
                          "on E0's resolution -- AG's accessibility heads are 128 bp-native, "
                          "and a 128 bp arm compared to a 1 bp floor is the same error the "
                          "--pool-bp flag in eval_many_loci.py exists to prevent.")
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
 
     sys.path.insert(0, str(Path(__file__).parent))
@@ -148,6 +149,16 @@ def main() -> int:
             nl = int(live.sum())
             sel = (torch.randperm(nl, generator=gen)[:a.pos_per_locus]
                    if nl > a.pos_per_locus else torch.arange(nl))
+        # per-stratum subsamples, drawn once per window in eval_many_loci.py's order
+        ssel = {}
+        for g, cols in strata.items():
+            if len(cols) < 2:
+                continue
+            lg = Yt[:, cols].std(1) > 1e-6
+            ng = int(lg.sum())
+            if ng:
+                ssel[g] = (lg, torch.randperm(ng, generator=gen)[:a.pos_per_locus]
+                           if ng > a.pos_per_locus else None)
         for k, Pn in preds.items():
             s = stats[k]
             P = torch.from_numpy(np.ascontiguousarray(Pn))
@@ -161,16 +172,11 @@ def main() -> int:
                 da = Pl - Pl.mean(1, keepdim=True); db = Yl - Yl.mean(1, keepdim=True)
                 s["acr"].append(((da * db).sum(1) /
                                  (da.norm(dim=1) * db.norm(dim=1)).clamp_min(1e-8)))
-            for g, cols in strata.items():
-                if len(cols) < 2:
-                    continue
-                Pg, Yg = P[:, cols], Yt[:, cols]
-                lg = Yg.std(1) > 1e-6
-                Pg, Yg = Pg[lg], Yg[lg]
-                if not Pg.shape[0]:
-                    continue
-                if Pg.shape[0] > a.pos_per_locus:
-                    Pg, Yg = Pg[:a.pos_per_locus], Yg[:a.pos_per_locus]
+            for g, (lg, sg) in ssel.items():
+                cols = strata[g]
+                Pg, Yg = P[:, cols][lg], Yt[:, cols][lg]
+                if sg is not None:
+                    Pg, Yg = Pg[sg], Yg[sg]
                 dc = Pg - Pg.mean(1, keepdim=True); dd = Yg - Yg.mean(1, keepdim=True)
                 s["acr_by_assay"][g].append(((dc * dd).sum(1) /
                                              (dc.norm(dim=1) * dd.norm(dim=1)).clamp_min(1e-8)))
@@ -207,7 +213,7 @@ def main() -> int:
     res["track_labels"] = [{"i": i, "assay": x.get("assay"), "tissue": x.get("tissue"),
                             "study": x.get("study"), "track_id": x.get("track_id")}
                            for i, x in enumerate(ds.tracks[:Teff])]
-    out = a.out or (None)
+    out = a.out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(res, indent=1))
     for k, v in res["baselines"].items():

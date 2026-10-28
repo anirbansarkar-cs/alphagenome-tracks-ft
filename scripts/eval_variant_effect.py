@@ -12,9 +12,9 @@ a label-free, rank-based discrimination task that needs no variant truth set.
                              0.98. It restates "predictions are bigger in peaks".
      relative |Delta|/level  inverts, because a near-zero background denominator inflates the
                              ratio. Measured: 0.13-0.44, anti-correlated with level.
-   ⇒ **Neither may be quoted.** The headline is the LEVEL-MATCHED AUROC: stratify positions into
-     quantiles of predicted level and compute the AUROC within strata, so the confound is held
-     fixed by construction. All three are reported side by side so the confound stays visible.
+   ⇒ **Neither may be quoted alone.** The headline is the LEVEL-MATCHED AUROC (AUROC within
+     quantiles of predicted level, so the confound is held fixed). `variant_report.py` computes
+     it, with loci-bootstrap intervals, from this script's --out file.
 
 🚨 FOUR CONTROLS, NONE OPTIONAL:
    1. NO-OP SUBSTITUTION. Replacing the reference base with itself must give EXACTLY zero. This is
@@ -26,8 +26,7 @@ a label-free, rank-based discrimination task that needs no variant truth set.
    4. THE EASY VERSION FIRST. AUROC using the prediction LEVEL, no variant at all. If the model
       cannot separate peak from background by level, its variant numbers mean nothing.
 
-📒 Positions inside one window are autocorrelated, so `--n-loci` is the unit of independence and
-   every interval bootstraps over LOCI, not positions.
+📒 Positions inside one window are autocorrelated, so `--n-loci` is the unit of independence.
 """
 from __future__ import annotations
 
@@ -38,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-ACC_ASSAYS = ("ATAC-seq", "DNase-Hypersensitivity")
+ACC_ASSAYS = ("ATAC", "DNASE")        # matched as substrings of the manifest's `assay`
 BASES = "ACGT"
 
 
@@ -82,9 +81,10 @@ def main() -> int:
                     help="observed-accessibility quantile at or above which a position is a PEAK")
     ap.add_argument("--bg-q", type=float, default=0.50,
                     help="quantile at or below which a position is BACKGROUND")
-    ap.add_argument("--edge-margin", type=int, default=4096,
+    ap.add_argument("--edge-margin", type=int, default=1024,
                     help="output positions this close to either edge are never chosen")
-    ap.add_argument("--out", type=Path, default=None)
+    ap.add_argument("--out", type=Path, required=True,
+                    help="JSON for variant_report.py, which reads $AGTRACKS_RESULTS/ve_<split>_<tag>.json")
     a = ap.parse_args()
 
     from agtracks.dataset import GenomeWindowDataset
@@ -105,8 +105,9 @@ def main() -> int:
                               max_tracks=t.get("max_tracks"), track_seed=t.get("track_seed", 0))
     T = ds.n_tracks()
     assay = [str(x.get("assay", "?")) for x in ds.tracks]
-    acc = np.array([i for i, s in enumerate(assay) if s in ACC_ASSAYS], dtype=np.int64)
-    rna = np.array([i for i, s in enumerate(assay) if s not in ACC_ASSAYS], dtype=np.int64)
+    is_acc = [any(k in s.upper() for k in ACC_ASSAYS) for s in assay]
+    acc = np.array([i for i, s in enumerate(assay) if is_acc[i]], dtype=np.int64)
+    rna = np.array([i for i, s in enumerate(assay) if "RNA" in s.upper()], dtype=np.int64)
     if acc.size == 0:
         raise SystemExit("no accessibility tracks; the peak/background label is undefined")
     _raw = [x.get("track_mean") for x in ds.tracks]
@@ -229,18 +230,17 @@ def main() -> int:
 
     res = {
         "run": a.run.name, "ckpt": a.ckpt_name, "split": a.split,
-        "loss": t["loss"], "gene_tissue_weight": t["gene_tissue_weight"],
         "poisson_weight": t["poisson_weight"], "lr": t["lr"], "seed": t["seed"],
         "step": ck.get("step"), "manifest": Path(t["manifest"]).name,
         "n_tracks": T, "n_acc_tracks": int(acc.size), "n_rna_tracks": int(rna.size),
         "n_loci_requested": int(a.n_loci), "n_loci_used": len({r["locus"] for r in rows}),
         "n_positions": len(rows), "n_peak": int(lab.sum()), "n_background": int((~lab).sum()),
         "local_bp": a.local_bp, "peak_q": a.peak_q, "bg_q": a.bg_q,
-        # ---- THE HEADLINE: relative effect, level divided out ----
+        # ---- relative effect, level divided out (inverts the confound; see the docstring) ----
         "auroc_local_acc_rel": auroc(got["local_acc_rel"], lab),
         # ---- the absolute effect: real, but partly a restatement of the level. Never quote alone.
         "auroc_local_acc": auroc(got["local_acc"], lab),
-        "auroc_local_rna": auroc(got["local_rna"], lab),
+        "auroc_local_rna": auroc(got["local_rna"], lab) if rna.size else None,
         "auroc_global_acc": auroc(got["global_acc"], lab),
         # ---- the four controls ----
         "control_noop_max_abs_effect": noop_max,
@@ -273,12 +273,12 @@ def main() -> int:
         raise SystemExit(f"permutation null is {res['control_perm_null_mean']:.3f}, not ~0.5; "
                          "the AUROC implementation or the labels are wrong")
 
-    print(f"\n{res['run']} {a.split} step={res['step']} loss={res['loss']} lr={res['lr']}")
+    print(f"\n{res['run']} {a.split} step={res['step']} lr={res['lr']}")
     print(f"  positions {res['n_positions']} ({res['n_peak']} peak / {res['n_background']} bg) "
           f"over {res['n_loci_used']} loci")
-    print(f"  AUROC RELATIVE effect (headline) local ACC {res['auroc_local_acc_rel']:.4f}")
+    print(f"  AUROC relative effect            local ACC {res['auroc_local_acc_rel']:.4f}")
     print(f"  AUROC absolute effect            local ACC {res['auroc_local_acc']:.4f}   "
-          f"local RNA {res['auroc_local_rna']:.4f}   global ACC {res['auroc_global_acc']:.4f}")
+          f"local RNA {float('nan') if res['auroc_local_rna'] is None else res['auroc_local_rna']:.4f}   global ACC {res['auroc_global_acc']:.4f}")
     print(f"  CONTROLS  no-op {noop_max:.3e} (n={n_noop})   "
           f"perm null {res['control_perm_null_mean']:.4f}+-{res['control_perm_null_sd']:.4f}   "
           f"GC-only {res['control_gc_baseline_auroc']:.4f}   "
@@ -291,16 +291,15 @@ def main() -> int:
           f"{res['control_rel_effect_vs_level_spearman']:+.4f}")
     if abs(res["control_abs_effect_vs_level_spearman"]) > 0.90:
         print("  ⚠️ the ABSOLUTE effect is ~a monotone function of the predicted level, so its "
-              "AUROC restates control 4. Quote the RELATIVE number.")
+              "AUROC restates control 4. Quote the level-matched AUROC from variant_report.py.")
     if res["control_easy_task_level_auroc"] < 0.60:
         print("  ⚠️ THE EASY TASK IS NEAR CHANCE. Do not report the variant number: a model that "
               "cannot separate peak from background by prediction LEVEL has not earned a reading "
               "of its variant effects.")
 
-    if a.out:
-        a.out.parent.mkdir(parents=True, exist_ok=True)
-        a.out.write_text(json.dumps(res, indent=1))
-        print(f"  wrote {a.out}")
+    a.out.parent.mkdir(parents=True, exist_ok=True)
+    a.out.write_text(json.dumps(res, indent=1))
+    print(f"  wrote {a.out}")
     return 0
 
 

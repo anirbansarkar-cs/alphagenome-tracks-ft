@@ -21,7 +21,7 @@ Nothing here is species-specific. The species lives in three input files and one
 
 ```bash
 pip install -r requirements.txt
-pip install "alphagenome-pytorch @ git+https://github.com/genomicsxai/alphagenome-pytorch"
+pip install "alphagenome-pytorch @ git+https://github.com/genomicsxai/alphagenome-pytorch@6e3ace4a6665e8e12dd52ae4ee68b8d278872015"
 pip install -e .
 
 python tests/test_losses.py        # CPU only, no data, no checkpoint — run this first
@@ -38,7 +38,8 @@ run on, in case a loose lower bound bites. Two things it deliberately cannot ins
   `running_var`, so an uninitialised model trains with no normalisation and reports no error.
 
 Verified working set: Python 3.11.15, torch 2.11.0+cu130, numpy 2.4.3, safetensors 0.7.0,
-pyfaidx 0.9.0.3, pyBigWig 0.3.25, einops 0.8.0.
+pyfaidx 0.9.0.3, pyBigWig 0.3.25, einops 0.8.0. `alphagenome-pytorch` declares Python >= 3.12, so on
+3.11 pip needs `--ignore-requires-python` for that line.
 
 ## Run
 
@@ -51,12 +52,12 @@ python -m agtracks.train \
     --out runs/first
 ```
 
-`--organism-index`: AlphaGenome ships **two** organism rows, `0 = human`, `1 = mouse`. Pick the
-one your data is. A third species needs a wider embedding table than the published checkpoint has,
-which is outside this repo's scope.
+`--organism-index`: AlphaGenome ships **two** organism rows, `0 = human`, `1 = mouse`. Rows past
+these (`--num-organisms 3`, the default, adds row 2) start as copies of the human row, so
+`--organism-index 2` gives a new species its own row.
 
-`--steps` is absolute and `--resume` restores optimizer state and the step counter, so budgets
-chain rather than restart:
+`--steps` is absolute and `--resume` restores optimizer state, the step counter and the position
+in the data order, so budgets chain rather than restart (keep the batch size and GPU count):
 
 ```bash
 python -m agtracks.train ... --steps 6000  --out runs/first/a

@@ -103,9 +103,11 @@ def boot_loci(score, label, level, loci, n=2000, seed=0):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="val")
+    ap.add_argument("--split", default="test", help="as passed to eval_variant_effect.py")
     ap.add_argument("--pair", nargs=2, default=["model_a", "model_b"],
-                    metavar=("TAG_A", "TAG_B"))
+                    metavar=("TAG_A", "TAG_B"),
+                    help="reads $AGTRACKS_RESULTS/ve_<split>_<tag>.json (default dir: results), "
+                         "i.e. eval_variant_effect.py --out results/ve_test_<tag>.json")
     ap.add_argument("--replicates", nargs="*", default=[],
                     help="tags to pool as a run-to-run scatter estimate for the same metric")
     ap.add_argument("--boot", type=int, default=2000)

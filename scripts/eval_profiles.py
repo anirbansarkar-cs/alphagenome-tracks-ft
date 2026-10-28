@@ -31,7 +31,10 @@ Predictions are stored BINNED at 128 bp: 561 test windows x 1,048,576 bp x 48 tr
 113 GB at 1 bp, and every metric here is meaningful at 128 bp.
 
 Usage:
-    python scripts/eval_profiles.py --checkpoint runs/my_run/last.pt
+    python scripts/eval_profiles.py --checkpoint runs/my_run/best.pt --out reports/my_run.json
+
+Windows, manifest, FASTA, organism and resolution default to the run's own (saved in the
+checkpoint); the flags override them.
 """
 
 from __future__ import annotations
@@ -48,6 +51,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from agtracks import losses as PL
+from agtracks.dataset import norm_contig
 BIN = 128
 
 
@@ -104,29 +108,25 @@ def load_tss(gff_gz: Path, chroms: set[str]) -> dict[str, list[tuple[int, str]]]
             if line.startswith("#"):
                 continue
             f = line.rstrip("\n").split("\t")
-            if len(f) < 8 or f[2] != "gene" or f[0] not in chroms:
+            if len(f) < 8 or f[2] != "gene" or norm_contig(f[0]) not in chroms:
                 continue
             start, end, strand = int(f[3]) - 1, int(f[4]), f[6]
-            out[f[0]].append((start if strand == "+" else end - 1, strand))
+            out[norm_contig(f[0])].append((start if strand == "+" else end - 1, strand))
     return out
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", type=Path,
-                    default=None)
-    ap.add_argument("--windows", type=Path,
-                    default=None)
-    ap.add_argument("--manifest", type=Path,
-                    default=None)
-    ap.add_argument("--fasta", type=Path, required=True)
+    ap.add_argument("--checkpoint", type=Path, required=True, help="a trained run's .pt")
+    ap.add_argument("--windows", type=Path, default=None)
+    ap.add_argument("--manifest", type=Path, default=None)
+    ap.add_argument("--fasta", type=Path, default=None)
     ap.add_argument("--gff", type=Path, default=None,
                     help="optional annotation, for the TSS metrics only. Omitted -> those are "
                          "skipped and the rest of the report is unaffected.")
     ap.add_argument("--split", default="test")
     ap.add_argument("--n-windows", type=int, default=120)
-    ap.add_argument("--organism-index", type=int, default=2)
-    ap.add_argument("--num-organisms", type=int, default=3)
+    ap.add_argument("--organism-index", type=int, default=None)
     ap.add_argument("--skip-nulls", action="store_true")
     ap.add_argument("--rate-param", choices=["direct", "exp", "auto"], default="auto",
                     help="'auto' reads it from the checkpoint's saved args; checkpoints from "
@@ -140,13 +140,25 @@ def main() -> int:
     from agtracks.train import build_model
 
     dev = "cuda"
-    ds = GenomeWindowDataset(args.windows, args.manifest, args.fasta,
-                              split=args.split, require_local=False)
+    ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    targs = ck.get("args") or {}
+    if targs.get("target_clip", "none") != "none":
+        raise SystemExit("assumes a run trained with --target-clip none")
+    res = int(targs.get("bin_size", 1))                   # the head the run actually trained
+    org_idx = (args.organism_index if args.organism_index is not None
+               else targs["organism_index"])
+    ds = GenomeWindowDataset(args.windows or Path(targs["windows"]),
+                              args.manifest or Path(targs["manifest"]),
+                              args.fasta or Path(targs["fasta"]),
+                              split=args.split, require_local=False,
+                              max_tracks=targs.get("max_tracks"),
+                              track_seed=targs.get("track_seed", 0))
+    if ds.output_bp % BIN or ds.crop % res:
+        raise SystemExit(f"output {ds.output_bp} must divide by {BIN} and crop {ds.crop} by {res}")
     T = len(ds.tracks)
     tracks = ds.tracks
     print(f"split={args.split}  windows={len(ds)}  tracks={T}", flush=True)
 
-    ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     # Resolve the rate parameterisation from the checkpoint. A pre-fix checkpoint has no
     # 'rate_param' in its saved args and MUST be scored with 'exp', because that is what its
     # weights were fit under; scoring it with 'direct' would be meaningless, not conservative.
@@ -160,8 +172,8 @@ def main() -> int:
     # build_model refuses a None checkpoint (RMSBatchNorm never updates running_var, so a
     # randomly-initialised model would run with no normalisation and report nothing wrong).
     # Build from the base checkpoint to satisfy that guard, then overwrite with OUR weights.
-    model, head = build_model(num_tracks=T, num_organisms=args.num_organisms,
-                              checkpoint=None,
+    model, head = build_model(num_tracks=T, num_organisms=targs["num_organisms"],
+                              checkpoint=Path(targs["checkpoint"]),
                               grad_ckpt=False, device=dev)
     miss_m, unexp_m = model.load_state_dict(ck["model"], strict=False)
     miss_h, unexp_h = head.load_state_dict(ck["head"], strict=False)
@@ -186,20 +198,23 @@ def main() -> int:
     GC = np.zeros((len(idxs), nb), dtype=np.float32)
     meta = []
     rng = random.Random(0)
-    org = torch.full((1,), args.organism_index, dtype=torch.long, device=dev)
+    org = torch.full((1,), org_idx, dtype=torch.long, device=dev)
+    crop, out_bp = ds.crop, ds.output_bp
 
     @torch.no_grad()
     def predict(oh: np.ndarray) -> np.ndarray:
         x = torch.from_numpy(oh).unsqueeze(0).to(dev)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = model(x, org, embeddings_only=True, channels_last=False,
-                        resolutions=(1, 128))
-            pl = head({1: out["embeddings_1bp"]}, org, return_scaled=True,
-                      channels_last=True)[1]
+                        resolutions=(res,))
+            key = "embeddings_1bp" if res == 1 else "embeddings_128bp"
+            pl = head({res: out[key]}, org, return_scaled=True, channels_last=True)[res]
         # MUST match how the checkpoint was trained. Pre-fix runs exponentiated the head
         # output (flooring every prediction at 1.0); fixed runs use it directly as the rate.
-        p = PL.rate_from_head(pl.float(), RATE_PARAM).squeeze(0).cpu().numpy()   # (L, T)
-        return p.reshape(nb, BIN, T).mean(1)
+        p = PL.rate_from_head(pl.float(), RATE_PARAM).squeeze(0).cpu().numpy()   # (L/res, T)
+        # the head spans the whole input; keep the central output window
+        p = p[crop // res:(crop + out_bp) // res]
+        return p.reshape(nb, BIN // res, T).mean(1)
 
     for j, i in enumerate(idxs):
         oh, y = ds[i]
@@ -207,7 +222,7 @@ def main() -> int:
         meta.append({"chrom": w["chrom"], "start": w["out_start"]})
         Y[j] = (y / scale).reshape(nb, BIN, T).mean(1)
         P[j] = predict(oh)
-        GC[j] = oh[:, 1:3].sum(1).reshape(nb, BIN).mean(1)          # C+G fraction per bin
+        GC[j] = oh[crop:crop + out_bp, 1:3].sum(1).reshape(nb, BIN).mean(1)   # C+G per bin
         if not args.skip_nulls:
             idx_seq = oh.argmax(1).astype(np.int64)
             idx_seq[oh.sum(1) == 0] = 0
@@ -291,7 +306,7 @@ def main() -> int:
                             for k, v in sorted(g.items())}
 
     # ---- tissue specificity: 22 RNA tracks are 22 DISTINCT TISSUES -------------------
-    rna = [i for i, t in enumerate(tracks) if t["assay"] == "RNA-Seq"]
+    rna = [i for i, t in enumerate(tracks) if "RNA" in str(t.get("assay", "")).upper()]
     if len(rna) >= 3:
         Pr_ = P.reshape(-1, T)[:, rna]; Yr_ = Y.reshape(-1, T)[:, rna]
         k2 = Yr_.std(1) > 1e-6
@@ -318,13 +333,13 @@ def main() -> int:
 
     # ---- TSS enrichment --------------------------------------------------------------
     if args.gff is not None and args.gff.exists():
-        chroms = {m["chrom"] for m in meta}
+        chroms = {norm_contig(m["chrom"]) for m in meta}
         tss = load_tss(args.gff, chroms)
         half = 16                                    # +/- 16 bins = +/- 2,048 bp
         accP = np.zeros(2 * half); accY = np.zeros(2 * half); nT = 0
         for j, m in enumerate(meta):
             lo, hi = m["start"], m["start"] + ds.output_bp
-            for pos, _s in tss.get(m["chrom"], []):
+            for pos, _s in tss.get(norm_contig(m["chrom"]), []):
                 if lo + half * BIN <= pos < hi - half * BIN:
                     b = (pos - lo) // BIN
                     accP += P[j, b - half:b + half].mean(1)
